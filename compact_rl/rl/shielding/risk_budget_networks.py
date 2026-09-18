@@ -39,8 +39,14 @@ def _shared_global_encoder(name, input_fc_layer_params, lstm_size, output_fc_lay
         name=name + "_lstm_encoder")
 
 
-def _global_input(observation):
-    return tf.concat([observation["state_features"], observation["action_distribution"]], axis=-1)
+def _global_input(observation, include_budget_features):
+    inputs = [observation["state_features"], observation["action_distribution"]]
+    if include_budget_features:
+        inputs.extend([
+            observation["remaining_risk"][..., tf.newaxis],
+            observation["allocation_slack"][..., tf.newaxis],
+        ])
+    return tf.concat(inputs, axis=-1)
 
 
 def _mvn_diag_output_spec(max_pairs, name):
@@ -74,6 +80,11 @@ def _mvn_diag_output_spec(max_pairs, name):
 class RiskBudgetActorNetwork(network.DistributionNetwork):
     """Masked-Gaussian actor over `max_pairs` risk-budget logit slots.
 
+    Current masked-PPO actors include remaining risk and allocatable slack in
+    the recurrent global input. ``include_budget_features=False`` retains the
+    old input shape solely so pre-existing PPO and REINFORCE checkpoints can
+    still be restored.
+
     Padding slots (`pair_mask == False`) have loc/scale hard-clamped to fixed
     constants (0, 1) via `tf.where`. Their input features are always exactly
     zero (by `RiskBudgetTrainingEnv`'s construction) and the environment
@@ -90,8 +101,9 @@ class RiskBudgetActorNetwork(network.DistributionNetwork):
     def __init__(self, input_tensor_spec, max_pairs, max_actions, state_feature_dim,
                  input_fc_layer_params=(64,), lstm_size=(32,), output_fc_layer_params=(64,),
                  pair_fc_layer_params=(64, 64), init_action_stddev=0.35, init_means_output_factor=0.1,
+                 include_budget_features=False,
                  name="RiskBudgetActorNetwork"):
-        global_input_dim = state_feature_dim + max_actions
+        global_input_dim = state_feature_dim + max_actions + (2 if include_budget_features else 0)
         lstm_encoder = _shared_global_encoder(
             name, input_fc_layer_params, lstm_size, output_fc_layer_params, global_input_dim)
         output_spec = _mvn_diag_output_spec(max_pairs, name)
@@ -104,6 +116,7 @@ class RiskBudgetActorNetwork(network.DistributionNetwork):
 
         self._lstm_encoder = lstm_encoder
         self.max_pairs = max_pairs
+        self.include_budget_features = include_budget_features
         self._pair_dense_layers = [
             tf.keras.layers.Dense(units, activation=tf.nn.relu, name=f"{name}_pair_fc_{i}")
             for i, units in enumerate(pair_fc_layer_params)
@@ -118,7 +131,8 @@ class RiskBudgetActorNetwork(network.DistributionNetwork):
 
     def call(self, observation, step_type, network_state=(), training=False):
         h, network_state = self._lstm_encoder(
-            _global_input(observation), step_type=step_type, network_state=network_state, training=training)
+            _global_input(observation, self.include_budget_features), step_type=step_type,
+            network_state=network_state, training=training)
 
         h_per_pair = tf.repeat(h[..., tf.newaxis, :], repeats=self.max_pairs, axis=-2)
         pair_input = tf.concat([
@@ -144,18 +158,18 @@ class RiskBudgetActorNetwork(network.DistributionNetwork):
 
 
 class RiskBudgetValueNetwork(network.Network):
-    """Plain scalar value estimate from the same global (state, proposed-action-
-    distribution) context used by the actor - mirrors ValueRnnNetwork's own
-    simplicity (no per-pair structure needed for a scalar baseline)."""
+    """Legacy recurrent scalar baseline retained for old PPO checkpoints."""
 
     def __init__(self, input_tensor_spec, max_actions, state_feature_dim,
                  input_fc_layer_params=(64,), lstm_size=(32,), output_fc_layer_params=(64,),
+                 include_budget_features=False,
                  name="RiskBudgetValueNetwork"):
-        global_input_dim = state_feature_dim + max_actions
+        global_input_dim = state_feature_dim + max_actions + (2 if include_budget_features else 0)
         lstm_encoder = _shared_global_encoder(
             name, input_fc_layer_params, lstm_size, output_fc_layer_params, global_input_dim)
         super().__init__(input_tensor_spec=input_tensor_spec, state_spec=lstm_encoder.state_spec, name=name)
         self._lstm_encoder = lstm_encoder
+        self.include_budget_features = include_budget_features
         self._value_layer = tf.keras.layers.Dense(
             1, activation=None,
             kernel_initializer=tf.keras.initializers.VarianceScaling(scale=0.1),
@@ -163,6 +177,7 @@ class RiskBudgetValueNetwork(network.Network):
 
     def call(self, observation, step_type, network_state=(), training=False):
         h, network_state = self._lstm_encoder(
-            _global_input(observation), step_type=step_type, network_state=network_state, training=training)
+            _global_input(observation, self.include_budget_features), step_type=step_type,
+            network_state=network_state, training=training)
         value = tf.squeeze(self._value_layer(h, training=training), axis=-1)
         return value, network_state

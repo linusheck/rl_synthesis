@@ -12,6 +12,11 @@ the current decision. It is given:
     the query is about is `s = history[-3]`.
   - `action_distribution`: the distribution `d` over actions in effect at `s` (same value as
     `history[-2]`, passed explicitly for convenience).
+  - `remaining_risk` and `slack`: the shield's pre-allocation budget state for `s`, where
+    `slack = min(remaining_risk, qmax(s, d)) - qmin(s, d)`.
+  - `context_history`: the exact `(remaining_risk, slack)` sequence aligned with the
+    `(state, distribution, action)` triples in `history`. Recurrent implementations use it
+    when they need to replay a trajectory after an inference-cache miss.
 
 and must return a distribution over `Act x S` (action, next-state pairs): a
 `dict[(action, state), float]` whose support is restricted to pairs `(a, s')` such that
@@ -31,7 +36,7 @@ import numpy as np
 import tensorflow as tf
 from tf_agents.trajectories import time_step as ts
 
-from compact_rl.rl.shielding.model_info import ModelInfo
+from compact_rl.rl.shielding.model_info import ModelInfo, observation_index
 
 State = int
 Action = int
@@ -64,12 +69,17 @@ class RiskBudgetFunction(ABC):
     """Abstract interface for a risk-budget function used by `ShieldWithBudget`."""
 
     @abstractmethod
-    def __call__(self, history: History, action_distribution: Distribution) -> BudgetDistribution:
+    def __call__(self, history: History, action_distribution: Distribution, *,
+                 remaining_risk: float | None = None, slack: float | None = None,
+                 context_history: list[tuple[float, float]] | None = None) -> BudgetDistribution:
         """Return a distribution over (action, next-state) pairs reachable from the current state.
 
         Args:
             history: trajectory so far; the current state is `s = history[-3]`.
             action_distribution: the distribution `d` over actions currently in effect at `s`.
+            remaining_risk: risk available at `s` before this allocation is applied.
+            slack: allocatable risk above `qmin(s, d)`.
+            context_history: budget contexts for all complete steps in `history`.
 
         The returned distribution's support must be restricted to pairs `(a, s')` with
         `action_distribution[a] * P(s, a, s') > 0`.
@@ -88,7 +98,7 @@ class UniformRiskBudget(RiskBudgetFunction):
     def __init__(self, model_info: ModelInfo):
         self.model_info = model_info
 
-    def __call__(self, history: History, action_distribution: Distribution) -> BudgetDistribution:
+    def __call__(self, history: History, action_distribution: Distribution, **_context) -> BudgetDistribution:
         state = history[-3]
 
         probs = reachable_pair_probs(self.model_info, state, action_distribution)
@@ -113,7 +123,7 @@ class HeadroomRiskBudget(RiskBudgetFunction):
     def __init__(self, model_info: ModelInfo):
         self.model_info = model_info
 
-    def __call__(self, history: History, action_distribution: Distribution) -> BudgetDistribution:
+    def __call__(self, history: History, action_distribution: Distribution, **_context) -> BudgetDistribution:
         state = history[-3]
 
         probs = reachable_pair_probs(self.model_info, state, action_distribution)
@@ -140,7 +150,7 @@ class CapacityRiskBudget(RiskBudgetFunction):
     def __init__(self, model_info: ModelInfo):
         self.model_info = model_info
 
-    def __call__(self, history: History, action_distribution: Distribution) -> BudgetDistribution:
+    def __call__(self, history: History, action_distribution: Distribution, **_context) -> BudgetDistribution:
         state = history[-3]
 
         probs = reachable_pair_probs(self.model_info, state, action_distribution)
@@ -164,25 +174,22 @@ class NNRiskBudget(RiskBudgetFunction):
     interface every other budget function uses, so it can be evaluated with the same
     methodology (shielding.py, the eval CSV/table).
 
-    The network is recurrent, but `RiskBudgetFunction.__call__` has no notion of a
-    persistent per-lane call identity (deliberately - the interface is meant to work for any
-    representation, including ones with no state at all). Rather than adding one, this caches
-    the LSTM's `network_state` after each call, keyed by `id(history)` - `ShieldWithBudget`
+    The network is recurrent, but `RiskBudgetFunction.__call__` has no explicit persistent
+    per-lane identity. This caches the LSTM's `network_state` after each call, keyed by
+    `id(history)` - `ShieldWithBudget`
     (and `ShieldProcessor`'s own per-lane tracking) mutate the SAME list object in place across
     consecutive calls within an episode (`history.append(...)`) and only ever replace it with a
     fresh list on episode reset, so `id(history)` is a stable, zero-cost proxy for "same lane,
-    same episode, one step later" - without needing any change to the stateless
-    `RiskBudgetFunction` interface itself (which is deliberately meant to work for any
-    representation, including ones with no state at all).
+    same episode, one step later".
 
     On a cache hit (`id(history)` seen before, `num_steps` grew by exactly 1, and the
     episode's first state matches - guards against the vanishingly unlikely case of `id()`
     being reused for an unrelated object) only the ONE new (state, distribution) step is fed
     through the LSTM, using the cached state as `network_state` - O(1) instead of O(episode
     length so far). On a miss (first call for this history, or anything not matching the
-    invariants above) it falls back to replaying the full history from scratch exactly as
-    before, correctness never depends on the cache being right - a miss just costs the old
-    O(episode length) instead of O(1).
+    invariants above) it falls back to replaying the full history, including the aligned
+    remaining-risk/slack context supplied by `ShieldWithBudget`. Correctness therefore never
+    depends on the cache being right; a miss only costs O(episode length) instead of O(1).
     """
 
     _MAX_CACHE_ENTRIES = 20000
@@ -199,7 +206,7 @@ class NNRiskBudget(RiskBudgetFunction):
     def _features(self, state):
         # ShieldProcessor passes environment.observation_valuations, indexed by
         # observation ID. Use the same mapping as the training environment.
-        observation = self.model_info.model.get_observation(state)
+        observation = observation_index(self.model_info.model, state)
         return np.asarray(self.state_features[observation], dtype=np.float32)
 
     def _pair_features(self, state, action_distribution, feature_dim):
@@ -228,7 +235,7 @@ class NNRiskBudget(RiskBudgetFunction):
         weights = weights / weights.sum()
         return {pair: float(w) for (pair, _), w in zip(pairs, weights)}
 
-    def _full_replay(self, history, state, action_distribution):
+    def _full_replay(self, history, state, action_distribution, context_history):
         states_seq = history[0::3]
         distributions_seq = history[1::3]
         num_steps = len(states_seq)
@@ -239,6 +246,15 @@ class NNRiskBudget(RiskBudgetFunction):
         action_distribution_seq = np.zeros([num_steps, self.max_actions], dtype=np.float32)
         for i, d in enumerate(distributions_seq):
             action_distribution_seq[i, :len(d)] = d
+        if context_history is None or len(context_history) != num_steps:
+            raise ValueError(
+                "NNRiskBudget needs one (remaining_risk, slack) context per history step "
+                "when replaying its recurrent actor."
+            )
+        remaining_risk_seq = np.asarray(
+            [context[0] for context in context_history], dtype=np.float32)
+        allocation_slack_seq = np.asarray(
+            [context[1] for context in context_history], dtype=np.float32)
 
         pairs, pair_state_features, pair_action_onehot, pair_prob, pair_vmin, pair_vmax, pair_mask = (
             self._pair_features(state, action_distribution, feature_dim))
@@ -253,6 +269,8 @@ class NNRiskBudget(RiskBudgetFunction):
         observation = {
             "state_features": tf.constant(state_features_seq[np.newaxis, ...]),
             "action_distribution": tf.constant(action_distribution_seq[np.newaxis, ...]),
+            "remaining_risk": tf.constant(remaining_risk_seq[np.newaxis, ...]),
+            "allocation_slack": tf.constant(allocation_slack_seq[np.newaxis, ...]),
             "pair_state_features": tf.constant(tile_seq(pair_state_features)[np.newaxis, ...]),
             "pair_action_onehot": tf.constant(tile_seq(pair_action_onehot)[np.newaxis, ...]),
             "pair_prob": tf.constant(tile_seq(pair_prob)[np.newaxis, ...]),
@@ -267,7 +285,7 @@ class NNRiskBudget(RiskBudgetFunction):
         loc = dist.parameters["loc"].numpy()[0, -1]
         return loc, pairs, new_network_state, num_steps, states_seq[0]
 
-    def _incremental_step(self, state, action_distribution, cached_state):
+    def _incremental_step(self, state, action_distribution, remaining_risk, slack, cached_state):
         network_state, _, _ = cached_state
         feature_dim = self._features(state).shape[-1]
         pairs, pair_state_features, pair_action_onehot, pair_prob, pair_vmin, pair_vmax, pair_mask = (
@@ -280,6 +298,8 @@ class NNRiskBudget(RiskBudgetFunction):
         observation = {
             "state_features": tf.constant(new_state_features[np.newaxis, np.newaxis, ...]),
             "action_distribution": tf.constant(new_action_distribution[np.newaxis, np.newaxis, ...]),
+            "remaining_risk": tf.constant([[remaining_risk]], dtype=tf.float32),
+            "allocation_slack": tf.constant([[slack]], dtype=tf.float32),
             "pair_state_features": tf.constant(pair_state_features[np.newaxis, np.newaxis, ...]),
             "pair_action_onehot": tf.constant(pair_action_onehot[np.newaxis, np.newaxis, ...]),
             "pair_prob": tf.constant(pair_prob[np.newaxis, np.newaxis, ...]),
@@ -292,9 +312,13 @@ class NNRiskBudget(RiskBudgetFunction):
         loc = dist.parameters["loc"].numpy()[0, -1]
         return loc, pairs, new_network_state
 
-    def __call__(self, history: History, action_distribution: Distribution) -> BudgetDistribution:
+    def __call__(self, history: History, action_distribution: Distribution, *,
+                 remaining_risk: float | None = None, slack: float | None = None,
+                 context_history: list[tuple[float, float]] | None = None) -> BudgetDistribution:
         state = history[-3]
         assert list(history[-2]) == list(action_distribution) or history[-2] == action_distribution
+        if remaining_risk is None or slack is None:
+            raise ValueError("NNRiskBudget requires remaining_risk and slack from ShieldWithBudget.")
 
         key = id(history)
         cached = self._state_cache.get(key)
@@ -305,10 +329,11 @@ class NNRiskBudget(RiskBudgetFunction):
         first_state = history[0]
 
         if cached is not None and cached[1] == num_steps - 1 and cached[2] == first_state:
-            loc, pairs, new_network_state = self._incremental_step(state, action_distribution, cached)
+            loc, pairs, new_network_state = self._incremental_step(
+                state, action_distribution, remaining_risk, slack, cached)
         else:
             loc, pairs, new_network_state, num_steps, first_state = self._full_replay(
-                history, state, action_distribution)
+                history, state, action_distribution, context_history)
 
         if len(self._state_cache) >= self._MAX_CACHE_ENTRIES:
             self._state_cache.clear()

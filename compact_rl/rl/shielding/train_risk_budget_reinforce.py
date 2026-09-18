@@ -31,7 +31,9 @@ from compact_rl.rl.environment.environment_wrapper_vec import EnvironmentWrapper
 from compact_rl.rl.environment.tf_py_environment import TFPyEnvironment
 from compact_rl.rl.shielding.risk_budget_networks import RiskBudgetActorNetwork
 from compact_rl.rl.shielding.risk_budget_training_env import RiskBudgetTrainingEnv
-from compact_rl.rl.shielding.train_risk_budget_shield import build_model_info, build_shielded_policy
+from compact_rl.rl.shielding.train_risk_budget_shield import (
+    build_model_info, build_shielded_policy, resolve_fixed_agent_folder,
+)
 from compact_rl.rl.tests.general_test_tools import init_args
 
 
@@ -263,7 +265,11 @@ def main():
     model_info = build_model_info(model)
 
     tf_env = TFPyEnvironment(environment)
-    policy = build_shielded_policy(environment, tf_env, args, args_cli.load_agent)
+    fixed_agent_folder = resolve_fixed_agent_folder(
+        args_cli.project_path, args_cli.load_agent
+    )
+    print(f"Loading fixed agent from: {fixed_agent_folder}")
+    policy = build_shielded_policy(environment, tf_env, args, fixed_agent_folder)
 
     train_env = RiskBudgetTrainingEnv(environment=environment, policy=policy, model_info=model_info,
                                        actions=environment.action_keywords, nu=args_cli.nu, gamma=args_cli.gamma,

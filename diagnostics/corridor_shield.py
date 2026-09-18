@@ -62,7 +62,7 @@ class RetryBudget:
     def __init__(self, model_info):
         self.model_info = model_info
 
-    def __call__(self, history, distribution):
+    def __call__(self, history, distribution, **_context):
         pairs = reachable_pair_probs(self.model_info, history[-3], distribution)
         weights = {pair: float(coordinates(self.model_info.model, pair[1]) in ((0, 0), (0, 1)))
                    for pair in pairs}
@@ -72,7 +72,7 @@ class RetryBudget:
 
 class InteriorBudget(RetryBudget):
     """A strictly positive proposal with finite logits, also allowing this policy."""
-    def __call__(self, history, distribution):
+    def __call__(self, history, distribution, **_context):
         state = history[-3]
         pairs = reachable_pair_probs(self.model_info, state, distribution)
         xy = coordinates(self.model_info.model, state)

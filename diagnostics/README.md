@@ -134,3 +134,93 @@ fresh sampled episodes, so small differences in nonzero costs are noisy.
 The first baseline/active-mask runs predated one extra diagnostic reset added
 for logging initial logits; their random streams are not precisely paired with
 the later runs. All settings and intermediate results are retained in `results.json`.
+
+## Production trainer
+
+The consequential-choice mask and clipped PPO estimator are also implemented
+in `compact_rl/rl/shielding/train_risk_budget_shield.py`. Unlike the old
+TF-Agents driver, it uses complete Monte-Carlo returns, removes forced
+allocations only from the actor loss, standardizes active advantages, trains a
+pre-action value baseline, and applies several clipped PPO epochs.
+
+For example:
+
+```sh
+export MPLCONFIGDIR=/tmp/rl-synthesis-mpl
+./.venv/bin/python -m compact_rl.rl.shielding.train_risk_budget_shield \
+  models/shielding/test-corridor \
+  --load-agent corridor-iter-1 \
+  --nu .0625 --episode-length 20 \
+  --num-environments 32 --window-steps 84 \
+  --num-iterations 100 --seed 7 \
+  --save-agent /tmp/corridor-budget-ppo
+
+./.venv/bin/python shielding.py models/shielding/test-corridor \
+  --shield budget --budget nn \
+  --budget-checkpoint /tmp/corridor-budget-ppo \
+  --load-agent corridor-iter-1 --nu .0625
+```
+
+`--load-agent` accepts either a checkpoint directory or a name below
+`trained_agents/<project>/`. Training now fails immediately if that checkpoint
+cannot be found; the previous path passed a missing name through to the fixed
+agent, whose loader silently continued without restoring data.
+
+The production PPO actor receives the current remaining risk and allocatable
+slack as explicit inputs. New checkpoints therefore have two extra columns in
+the actor's global encoder. The loader detects and still accepts older
+actor-only and legacy PPO checkpoints, whose actors continue to infer this
+context from recurrent state.
+
+To train against a uniform random policy instead of a saved agent, replace
+`--load-agent ...` with `--uniform-random-policy`. The random policy is uniform
+over the actions enabled in each state and remains fixed while the budget actor
+is trained.
+
+Models whose unsafe-state label is not `bad` can select it with
+`--bad-state-label`; for example, `models/shielding/avoid-10-2` uses `traps`.
+
+For a larger native MDP and a fixed uniform-random policy:
+
+```sh
+MPLCONFIGDIR=/tmp/rl-synthesis-mpl ./.venv/bin/python -m \
+  compact_rl.rl.shielding.train_risk_budget_shield \
+  models/shielding/avoid-10-2 \
+  --uniform-random-policy --bad-state-label traps \
+  --nu .1 --episode-length 100 \
+  --num-environments 16 --window-steps 256 \
+  --num-iterations 100 --seed 7 \
+  --save-agent results/risk-budgets/avoid-10-2-random
+
+MPLCONFIGDIR=/tmp/rl-synthesis-mpl ./.venv/bin/python shielding.py \
+  models/shielding/avoid-10-2 \
+  --shield budget --budget nn \
+  --budget-checkpoint results/risk-budgets/avoid-10-2-random \
+  --uniform-random-policy --bad-state-label traps \
+  --nu .1 --episode-length 100
+```
+
+For a learned agent deployed greedily, first train the PPO policy and then
+select its enabled-action argmax while training the budget actor. For example,
+on `dpm`:
+
+```sh
+MPLCONFIGDIR=/tmp/rl-synthesis-mpl ./.venv/bin/python shielding.py \
+  models/shielding/dpm \
+  --agent-training --save-agent greedy-ppo \
+  --training-iterations 100 --episode-length 100 \
+  --num-environments 64 --seed 7
+
+MPLCONFIGDIR=/tmp/rl-synthesis-mpl ./.venv/bin/python -m \
+  compact_rl.rl.shielding.train_risk_budget_shield \
+  models/shielding/dpm \
+  --load-agent greedy-ppo-iter-100 --deterministic-agent \
+  --nu .1 --episode-length 100 \
+  --num-environments 16 --window-steps 256 \
+  --num-iterations 100 --seed 7 \
+  --save-agent results/risk-budgets/dpm-greedy
+```
+
+The PPO checkpoint stores logits rather than a separate greedy policy;
+`--deterministic-agent` is what turns those logits into the fixed enabled-action
+argmax distribution seen by the shield trainer.

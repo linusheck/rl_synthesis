@@ -814,6 +814,10 @@ class ShieldWithBudget(Shield):
 
         self.remaining_risk = [min(self.nu, self.vmax_at_initial_state)]
         self.history = [[]]
+        # Exact actor-side budget features aligned with the complete
+        # (state, distribution, action) triples in history. This lets a recurrent neural
+        # budget replay its inputs exactly after an inference-cache miss.
+        self.budget_context_history = [[]]
         self.last_states = [None]
         self.last_distributions = [None]
         self.last_qmin_ds = [None]
@@ -948,6 +952,7 @@ class ShieldWithBudget(Shield):
         if trace_index >= len(self.remaining_risk):
             self.remaining_risk.append(min(self.nu, self.vmax_at_initial_state))
             self.history.append([])
+            self.budget_context_history.append([])
             self.last_states.append(None)
             self.last_distributions.append(None)
             self.last_qmin_ds.append(None)
@@ -967,6 +972,7 @@ class ShieldWithBudget(Shield):
             self._episode_started[trace_index] = True
             self.remaining_risk[trace_index] = min(self.nu, self.vmax_at_initial_state)
             self.history[trace_index] = []
+            self.budget_context_history[trace_index] = []
         else:
             assert self.last_states[trace_index] is not None, "Last state is None on non-reset."
             assert self.last_distributions[trace_index] is not None, "Last distribution is None on non-reset."
@@ -983,7 +989,14 @@ class ShieldWithBudget(Shield):
             qmax = self._qmax(self.last_states[trace_index], self.last_distributions[trace_index])
             slack = min(self.remaining_risk[trace_index], qmax) - self.last_qmin_ds[trace_index]
 
-            risk_budget_distribution = self.budget(self.history[trace_index], self.last_distributions[trace_index])
+            self.budget_context_history[trace_index].append(
+                (self.remaining_risk[trace_index], slack)
+            )
+            risk_budget_distribution = self.budget(
+                self.history[trace_index], self.last_distributions[trace_index],
+                remaining_risk=self.remaining_risk[trace_index], slack=slack,
+                context_history=self.budget_context_history[trace_index],
+            )
             if self.force_wasteless_budget:
                 risk_budget_distribution = self._make_wasteless(
                     risk_budget_distribution, self.last_states[trace_index], self.last_distributions[trace_index], slack)

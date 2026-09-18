@@ -147,6 +147,7 @@ def set_global_seeds(seed):
 @click.command()
 @click.argument('project', type=click.Path(exists=True))
 @click.option("--nu", type=float, default=0.05, help="Safety threshold for the shielding.")
+@click.option("--bad-state-label", type=str, default="bad", help="Model label defining unsafe states for shielding.")
 @click.option("--shield", type=click.Choice([None, 'identity', 'standard', 'pessimistic', 'optimistic', 'delta', 'self-constructing-safe', 'self-constructing-unsafe', 'budget']), default=None, help="Shielding method to use.")
 @click.option("--budget", type=click.Choice(list(BUDGET_FUNCTIONS.keys()) + ["nn", "nn-reinforce"]), default="uniform", help="Risk-budget function to use when --shield=budget. 'nn'/'nn-reinforce' load a trained network from --budget-checkpoint (PPO- and REINFORCE-trained checkpoints respectively).")
 @click.option("--use-clamp", is_flag=True, default=False, help="For --shield=budget: use the old clamp-to-vmin-safe correction instead of the L1-closest-allowed projection, for comparison purposes only.")
@@ -176,7 +177,7 @@ def set_global_seeds(seed):
 @click.option("--goal-rew", type=float, default=100.0, help="Reward value for reaching the goal state.")
 @click.option("--fail-rew", type=float, default=-100.0, help="Reward value for reaching the fail state.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
-def main(project, nu, shield, budget, use_clamp, budget_checkpoint, no_force_wasteless_budget, gamma, load_agent, save_agent, agent_training, deterministic_agent, shield_memory, training_iterations, episode_length, min_episodes_per_environment, num_environments, num_parallel_environments, model_debug, save_shield, load_shield, save_budget, load_budget, uniform_random_policy, eval_file, budget_metrics_file, model_checking_eval, expected_shield_calls, goal_rew, fail_rew, seed):
+def main(project, nu, bad_state_label, shield, budget, use_clamp, budget_checkpoint, no_force_wasteless_budget, gamma, load_agent, save_agent, agent_training, deterministic_agent, shield_memory, training_iterations, episode_length, min_episodes_per_environment, num_environments, num_parallel_environments, model_debug, save_shield, load_shield, save_budget, load_budget, uniform_random_policy, eval_file, budget_metrics_file, model_checking_eval, expected_shield_calls, goal_rew, fail_rew, seed):
     project_path = project
     project_name = os.path.basename(os.path.normpath(project_path))
     prism_path = os.path.join(project_path, "sketch.templ")
@@ -193,10 +194,9 @@ def main(project, nu, shield, budget, use_clamp, budget_checkpoint, no_force_was
 
     # ---------------------------------------------------------
     # This is the learning
-    model = sketch.pomdp # If you don't have POMDP, you can switch to quotient mdp or some other MDP/POMDP representations.
-    # model = sketch.quotient_mdp
+    model = sketch.pomdp if hasattr(sketch, "pomdp") else sketch.quotient_mdp
 
-    assert "bad" in model.labeling.get_labels(), "Model must have 'bad' label for shielding."
+    assert bad_state_label in model.labeling.get_labels(), f"Model must have '{bad_state_label}' label for shielding."
 
     # TODO investigate this
     # args.batch_size = 1  # For evaluation, we use batch size 1
@@ -212,7 +212,7 @@ def main(project, nu, shield, budget, use_clamp, budget_checkpoint, no_force_was
         shield_folder = None
     
     if shield is not None:
-        shield_processor = ShieldProcessor(environment.action_keywords, model, nu, shield, args=args, shield_memory=shield_memory, debug=model_debug, shield_folder=shield_folder, deterministic_agent=deterministic_agent, budget=budget, use_clamp=use_clamp, environment=environment, budget_checkpoint=budget_checkpoint, force_wasteless_budget=not no_force_wasteless_budget, discount_factor=gamma)
+        shield_processor = ShieldProcessor(environment.action_keywords, model, nu, shield, args=args, shield_memory=shield_memory, debug=model_debug, shield_folder=shield_folder, deterministic_agent=deterministic_agent, budget=budget, use_clamp=use_clamp, environment=environment, budget_checkpoint=budget_checkpoint, force_wasteless_budget=not no_force_wasteless_budget, discount_factor=gamma, bad_state_label=bad_state_label)
         if load_budget is not None:
             shield_processor.load_budget(load_budget)
     else:
@@ -222,7 +222,7 @@ def main(project, nu, shield, budget, use_clamp, budget_checkpoint, no_force_was
         if shield is not None:
             print(f"WARNING: Loading shield and therefore ignoring the provided shield type {shield}.")
             shield_processor = None
-        shield_processor = ShieldProcessor(environment.action_keywords, model, nu, 'self-constructing-static', args=args, shield_memory=shield_memory, debug=model_debug, shield_folder=None, deterministic_agent=deterministic_agent)
+        shield_processor = ShieldProcessor(environment.action_keywords, model, nu, 'self-constructing-static', args=args, shield_memory=shield_memory, debug=model_debug, shield_folder=None, deterministic_agent=deterministic_agent, bad_state_label=bad_state_label)
         shield_processor.load_shield(f"results/shields/{project_name}/{load_shield}")
 
     if load_agent is not None:

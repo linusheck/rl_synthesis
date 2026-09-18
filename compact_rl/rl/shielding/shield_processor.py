@@ -1,7 +1,7 @@
 from compact_rl.rl.tools.args_emulator import ArgsEmulator
 import tensorflow as tf
 
-from compact_rl.rl.shielding.model_info import ModelInfo
+from compact_rl.rl.shielding.model_info import ModelInfo, observation_to_state_map
 import compact_rl.rl.shielding.shields
 from compact_rl.rl.shielding.constructed_shield_data import ShieldData
 from compact_rl.rl.shielding.risk_budget import BUDGET_FUNCTIONS, NNRiskBudget
@@ -37,13 +37,13 @@ class _RunningStat:
 
 
 class ShieldProcessor:
-    def __init__(self, actions : list[str], model : stormpy.storage.SparsePomdp, nu : float, shield_type : str, args : ArgsEmulator = None, shield_memory : int = 0, debug: bool = False, shield_folder: str = None, deterministic_agent: bool = False, budget: str = "uniform", use_clamp: bool = False, environment=None, budget_checkpoint: str = None, force_wasteless_budget: bool = True, discount_factor: float = 0.99):
+    def __init__(self, actions : list[str], model : stormpy.storage.SparsePomdp, nu : float, shield_type : str, args : ArgsEmulator = None, shield_memory : int = 0, debug: bool = False, shield_folder: str = None, deterministic_agent: bool = False, budget: str = "uniform", use_clamp: bool = False, environment=None, budget_checkpoint: str = None, force_wasteless_budget: bool = True, discount_factor: float = 0.99, bad_state_label: str = "bad"):
         self.args = args
         self.actions = actions
         self.shield_folder = shield_folder
         self.deterministic_agent = deterministic_agent
 
-        assert model.nr_states == model.nr_observations, "We currently only support shielding for MDPs."
+        assert model.nr_states == getattr(model, "nr_observations", model.nr_states), "We currently only support shielding for MDPs."
         assert model.initial_states is not None and len(model.initial_states) == 1, "We currently only support single initial state models."
 
         components = stormpy.SparseModelComponents(transition_matrix=model.transition_matrix,
@@ -59,8 +59,8 @@ class ShieldProcessor:
         mdp = stormpy.storage.SparseMdp(components)
 
         # get Vmin and Vmax values for all states
-        min_formula = stormpy.parse_properties("Pmin=? [ F \"bad\" ]")
-        max_formula = stormpy.parse_properties("Pmax=? [ F \"bad\" ]")
+        min_formula = stormpy.parse_properties(f'Pmin=? [ F "{bad_state_label}" ]')
+        max_formula = stormpy.parse_properties(f'Pmax=? [ F "{bad_state_label}" ]')
         min_result = stormpy.model_checking(mdp, min_formula[0])
         max_result = stormpy.model_checking(mdp, max_formula[0])
         vmin = min_result.get_values()
@@ -68,14 +68,14 @@ class ShieldProcessor:
         # Print vmin and vmax for the initial state
         print("Vmin and Vmax for initial state:", vmin[mdp.initial_states[0]], vmax[mdp.initial_states[0]])
 
-        self.bad_states = list(mdp.labeling.get_states("bad"))
+        self.bad_states = list(mdp.labeling.get_states(bad_state_label))
 
         # model checking results for debugging
         if debug:
             print(model)
             if "goal" in model.labeling.get_labels():
                 reach_formula = stormpy.parse_properties("Pmax=? [ F \"goal\" ]")
-                until_formula = stormpy.parse_properties("Pmax=? [ !\"bad\" U \"goal\" ]")
+                until_formula = stormpy.parse_properties(f'Pmax=? [ !"{bad_state_label}" U "goal" ]')
                 goal_formula = stormpy.parse_properties("Pmax=? [ F \"goal\" ]")
                 reach_result = stormpy.model_checking(mdp, reach_formula[0])
                 until_result = stormpy.model_checking(mdp, until_formula[0])
@@ -89,14 +89,9 @@ class ShieldProcessor:
             print("Max expected rewards to goal from initial state:", reward_result.get_values()[mdp.initial_states[0]])
             exit()
 
-        observation_to_state = [None] * model.nr_observations
-        for state in range(model.nr_states):
-            obs = model.get_observation(state)
-            observation_to_state[obs] = state
-
-        assert None not in observation_to_state, "Some observations do not map to any state."
+        observation_to_state = observation_to_state_map(model)
             
-        model_info = ModelInfo(model=model, observation_to_state=observation_to_state, bad_state="bad", vmin=vmin, vmax=vmax)
+        model_info = ModelInfo(model=model, observation_to_state=observation_to_state, bad_state=bad_state_label, vmin=vmin, vmax=vmax)
 
         if shield_type == 'identity':
             self.shield = compact_rl.rl.shielding.shields.IdentityShield(model_info=model_info, actions=self.actions)
@@ -155,24 +150,43 @@ class ShieldProcessor:
             assert type(self.shield) in [compact_rl.rl.shielding.shields.SelfConstructingShieldOnline, compact_rl.rl.shielding.shields.SelfConstructingShieldOffline], "Saving shield can only be used with self-constructing shields."
 
     def _load_nn_budget(self, model_info, environment, nu, budget_checkpoint):
-        """Builds a RiskBudgetActorNetwork matching train_risk_budget_shield.py's own
-        conventions, restores its weights from a checkpoint saved by that script, and wraps it
-        in NNRiskBudget for use as this shield's budget function. The full ppo_agent.PPOAgent
-        (not just the actor net) has to be reconstructed to match the object graph the
-        checkpoint was actually saved with (tf.train.Checkpoint(agent=...) in that script);
-        only the restored actor net is kept afterward. `policy=None` is safe here: the
-        RiskBudgetTrainingEnv instance is only used for its (policy-independent) specs, never
-        stepped."""
+        """Load either the current actor-only checkpoint or a legacy PPO checkpoint."""
         from compact_rl.rl.environment.tf_py_environment import TFPyEnvironment
         from compact_rl.rl.shielding.risk_budget_training_env import RiskBudgetTrainingEnv
-        from compact_rl.rl.shielding.train_risk_budget_shield import build_agent, load_agent
+        from compact_rl.rl.shielding.train_risk_budget_shield import (
+            build_actor_network, build_agent, load_agent, restore_masked_actor,
+        )
 
         train_env = RiskBudgetTrainingEnv(environment=environment, policy=None, model_info=model_info,
                                            actions=self.actions, nu=nu)
         tf_train_env = TFPyEnvironment(train_env)
-        agent = build_agent(train_env, tf_train_env)
-        load_agent(agent, budget_checkpoint)
-        return NNRiskBudget(model_info, agent._actor_net, self.actions, environment.observation_valuations)
+        latest = tf.train.latest_checkpoint(budget_checkpoint)
+        if latest is None:
+            raise FileNotFoundError(f"No checkpoint found at {budget_checkpoint}")
+        variable_names = [name for name, _ in tf.train.list_variables(latest)]
+        if any(name.startswith("actor_net/") for name in variable_names):
+            variables = dict(tf.train.list_variables(latest))
+            input_kernels = [
+                shape for name, shape in variables.items()
+                if name.startswith("actor_net/_lstm_encoder/_input_encoder/")
+                and name.endswith("kernel/.ATTRIBUTES/VARIABLE_VALUE")
+            ]
+            expected_input_dim = train_env._state_feature_dim + train_env.max_actions + 2
+            # Actor-only checkpoints produced before remaining risk and slack
+            # became explicit inputs have a global encoder two columns narrower.
+            include_budget_features = any(
+                shape and shape[0] == expected_input_dim for shape in input_kernels
+            )
+            actor = build_actor_network(
+                train_env, tf_train_env,
+                include_budget_features=include_budget_features,
+            )
+            restore_masked_actor(actor, budget_checkpoint)
+        else:
+            agent = build_agent(train_env, tf_train_env)
+            load_agent(agent, budget_checkpoint)
+            actor = agent._actor_net
+        return NNRiskBudget(model_info, actor, self.actions, environment.observation_valuations)
 
     def _load_nn_reinforce_budget(self, model_info, environment, nu, budget_checkpoint):
         """Same idea as _load_nn_budget, but for a checkpoint saved by

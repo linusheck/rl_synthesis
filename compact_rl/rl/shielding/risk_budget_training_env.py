@@ -7,8 +7,9 @@ the risk-budget allocation itself as the RL action to be trained.
 At each decision point, the observation given to the RL policy describes the current state,
 the action distribution currently in effect there (already shield-corrected), and the set of
 (action, next-state) pairs reachable under it - padded/masked to a fixed `max_pairs` (bounded
-by the model's branching factor, not its size, so this stays small even for large models). The
-action is a `max_pairs`-dimensional vector of logits; only the valid slots (per this step's
+by the model's branching factor, not its size, so this stays small even for large models). It
+also includes the current remaining risk and allocatable slack explicitly. The action is a
+`max_pairs`-dimensional vector of logits; only the valid slots (per this step's
 `pair_mask`) are used, softmax-normalized internally to form the actual risk-budget
 distribution handed to `ShieldWithBudget`'s own bookkeeping methods.
 
@@ -32,9 +33,27 @@ from tf_agents.trajectories import time_step_spec as build_time_step_spec
 
 from compact_rl.rl.environment import py_environment
 from compact_rl.rl.environment.environment_wrapper_vec import EnvironmentWrapperVec
-from compact_rl.rl.shielding.model_info import ModelInfo
+from compact_rl.rl.shielding.model_info import ModelInfo, observation_index
 from compact_rl.rl.shielding.risk_budget import UniformRiskBudget, reachable_pair_probs
 from compact_rl.rl.shielding.shields import ShieldWithBudget, clamp_distribution
+
+
+def allocation_choice_is_active(slack, capacities, eps=1e-10):
+    """Whether a wasteless allocation has more than one feasible outcome.
+
+    ``capacities`` are the unnormalised numerators
+    ``d(a) P(s,a,s') (Vmax(s') - Vmin(s'))``.  Dividing them by ``slack``
+    gives the per-pair upper bounds used by ``_make_wasteless``.  The refined
+    allocation is forced when no slack exists, at most one pair can absorb it,
+    or all capacity has to be saturated.
+    """
+    if slack <= eps:
+        return False
+    if sum(capacity > eps for capacity in capacities) <= 1:
+        return False
+    if sum(capacities) <= slack + eps:
+        return False
+    return True
 
 
 def compute_max_pairs(model_info: ModelInfo) -> tuple[int, int]:
@@ -58,7 +77,7 @@ def compute_max_pairs(model_info: ModelInfo) -> tuple[int, int]:
 class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
     def __init__(self, environment: EnvironmentWrapperVec, policy, model_info: ModelInfo,
                  actions: list, nu: float, gamma: float = 0.99, force_wasteless_budget: bool = True,
-                 use_l1_projection: bool = True):
+                 use_l1_projection: bool = True, deterministic_policy: bool = False):
         super().__init__()
         self.num_envs = environment.num_envs
         self._environment = environment
@@ -68,6 +87,7 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         self.nu = nu
         self.gamma = gamma
         self.force_wasteless_budget = force_wasteless_budget
+        self.deterministic_policy = deterministic_policy
 
         self.max_actions, self.max_branching = compute_max_pairs(model_info)
         self.max_pairs = self.max_actions * self.max_branching
@@ -76,6 +96,8 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         self._obs_spec = {
             "state_features": tensor_spec.TensorSpec([self._state_feature_dim], tf.float32, "state_features"),
             "action_distribution": tensor_spec.TensorSpec([self.max_actions], tf.float32, "action_distribution"),
+            "remaining_risk": tensor_spec.TensorSpec([], tf.float32, "remaining_risk"),
+            "allocation_slack": tensor_spec.TensorSpec([], tf.float32, "allocation_slack"),
             "pair_state_features": tensor_spec.TensorSpec([self.max_pairs, self._state_feature_dim], tf.float32, "pair_state_features"),
             "pair_action_onehot": tensor_spec.TensorSpec([self.max_pairs, self.max_actions], tf.float32, "pair_action_onehot"),
             "pair_prob": tensor_spec.TensorSpec([self.max_pairs], tf.float32, "pair_prob"),
@@ -153,7 +175,16 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         policy_step = self._policy.distribution(time_step, self._policy_state)
         self._policy_state = policy_step.state
         logits = policy_step.action.logits.numpy()
-        return tf.nn.softmax(logits).numpy()
+        if not self.deterministic_policy:
+            return tf.nn.softmax(logits).numpy()
+
+        # Greedy deployment chooses the highest-logit enabled global action.
+        # Mask before argmax; choosing globally and filtering afterward can
+        # otherwise select an action unavailable in the current state.
+        mask = np.asarray(time_step.observation["mask"], dtype=bool)
+        masked_logits = np.where(mask, logits, -np.inf)
+        greedy_actions = np.argmax(masked_logits, axis=-1)
+        return np.eye(len(self.actions), dtype=np.float32)[greedy_actions]
 
     def _build_observation_for_lane(self, i, state, distribution):
         probs = reachable_pair_probs(self.model_info, state, distribution)
@@ -170,9 +201,13 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         # Fully observable means a bijection, not that observation IDs equal state IDs.
         model = self.model_info.model
         state_features = np.asarray(
-            self._environment.observation_valuations[model.get_observation(state)], dtype=np.float32)
+            self._environment.observation_valuations[observation_index(model, state)], dtype=np.float32)
         action_distribution = np.zeros([self.max_actions], dtype=np.float32)
         action_distribution[:len(distribution)] = distribution
+        qmin = self._shield._qmin(state, distribution)
+        qmax = self._shield._qmax(state, distribution)
+        remaining_risk = np.float32(self._remaining_risk[i])
+        allocation_slack = np.float32(min(self._remaining_risk[i], qmax) - qmin)
 
         pair_state_features = np.zeros([self.max_pairs, self._state_feature_dim], dtype=np.float32)
         pair_action_onehot = np.zeros([self.max_pairs, self.max_actions], dtype=np.float32)
@@ -182,7 +217,7 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         pair_mask = np.zeros([self.max_pairs], dtype=bool)
         for idx, ((a, s2), p) in enumerate(pairs):
             pair_state_features[idx] = np.asarray(
-                self._environment.observation_valuations[model.get_observation(s2)], dtype=np.float32)
+                self._environment.observation_valuations[observation_index(model, s2)], dtype=np.float32)
             pair_action_onehot[idx, a] = 1.0
             pair_prob[idx] = p
             pair_vmin[idx] = self.model_info.vmin[s2]
@@ -192,6 +227,8 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         return {
             "state_features": state_features,
             "action_distribution": action_distribution,
+            "remaining_risk": remaining_risk,
+            "allocation_slack": allocation_slack,
             "pair_state_features": pair_state_features,
             "pair_action_onehot": pair_action_onehot,
             "pair_prob": pair_prob,
@@ -217,10 +254,6 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
 
         slack = min(self._remaining_risk[i], qmax) - qmin
 
-        # No slack to distribute => allocation cannot matter.
-        if slack <= eps:
-            return False
-
         probs = reachable_pair_probs(
             self.model_info, state, distribution
         )
@@ -232,18 +265,7 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
             for (a, s2), p in probs.items()
         ]
 
-        positive = sum(c > eps for c in capacities)
-
-        # Only one successor can absorb risk => unique allocation.
-        if positive <= 1:
-            return False
-
-        # Total capacity exactly exhausts the slack:
-        # every capacity must be saturated, hence allocation is unique.
-        if sum(capacities) <= slack + eps:
-            return False
-
-        return True
+        return allocation_choice_is_active(slack, capacities, eps)
 
     def _reset(self):
         time_step = self._environment.reset()
@@ -278,6 +300,9 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
 
     def _step(self, action):
         action = np.asarray(action)  # [num_envs, max_pairs] logits
+        current_is_terminal = np.asarray(
+            self._current_time_step.step_type == ts.StepType.LAST
+        )
 
         # 1. qmax/slack depend only on already-known quantities (last state/distribution/qmin),
         #    not on this step's RL action - compute first, matching ShieldWithBudget.correct's
@@ -289,6 +314,13 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         local_last_actions = [0] * self.num_envs
         pending_risk_budget = [None] * self.num_envs
         for i in range(self.num_envs):
+            if current_is_terminal[i]:
+                # Batched lanes reset independently. The wrapped environment ignores this
+                # action while resetting the lane, but the other lanes still require a real
+                # step. Avoid translating the terminal sink's unlabeled local choice.
+                global_actions[i] = 0
+                pending_risk_budget[i] = {}
+                continue
             n = self._num_valid_pairs[i]
             logits = action[i, :n]
             weights = np.exp(logits - np.max(logits))
@@ -351,18 +383,32 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
                 self._last_used_risk_budget_share[i] = risk_budget
                 self._last_additive_boost[i] = additive_boost
 
-            local_proposed = self._map_to_local(new_state, proposed_probs[i])
-            qmin_d = self._shield._qmin(new_state, local_proposed)
-            if qmin_d > self._remaining_risk[i]:
-                output_distribution = self._correct_distribution(new_state, local_proposed, self._remaining_risk[i])
+            if is_terminal:
+                # Storm adds an absorbing sink choice without an action label to terminal
+                # states. There is no next policy decision (the following environment step
+                # auto-resets this lane), so it must not be translated through the global
+                # policy action list or counted as an intervention. A local distribution is
+                # still needed to construct the LAST observation with the normal fixed spec.
+                nr_actions = self.model_info.model.get_nr_available_actions(new_state)
+                local_proposed = [1.0 / nr_actions] * nr_actions
+                output_distribution = local_proposed
                 qmin_d = self._shield._qmin(new_state, output_distribution)
             else:
-                output_distribution = local_proposed
+                local_proposed = self._map_to_local(new_state, proposed_probs[i])
+                qmin_d = self._shield._qmin(new_state, local_proposed)
+                if qmin_d > self._remaining_risk[i]:
+                    output_distribution = self._correct_distribution(
+                        new_state, local_proposed, self._remaining_risk[i])
+                    qmin_d = self._shield._qmin(new_state, output_distribution)
+                else:
+                    output_distribution = local_proposed
 
             # The reward for the RL action chosen THIS call is only realized now, one decision
             # later (see module docstring) - D measures how much the just-realized transition's
             # remaining_risk forced the shield to deviate from the fixed policy's own proposal.
-            rewards[i] = -sum(abs(p - q) for p, q in zip(local_proposed, output_distribution))
+            rewards[i] = 0.0 if is_terminal else -sum(
+                abs(p - q) for p, q in zip(local_proposed, output_distribution)
+            )
             discounts[i] = 0.0 if is_terminal else self.gamma
 
             self._last_states[i] = new_state
