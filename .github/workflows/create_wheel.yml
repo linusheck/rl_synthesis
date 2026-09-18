@@ -22,7 +22,7 @@ jobs:
         run: |
           python -m pip install --user --upgrade build
           python -m build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: compact-rl-wheels
           path: ./dist/*.whl
@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build sdist
         run: pipx run build --sdist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: compact-rl-sdist
           path: dist/*.tar.gz
