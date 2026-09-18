@@ -196,6 +196,12 @@ class NNRiskBudget(RiskBudgetFunction):
         # id(history) -> (network_state, num_steps_processed, first_state)
         self._state_cache = {}
 
+    def _features(self, state):
+        # ShieldProcessor passes environment.observation_valuations, indexed by
+        # observation ID. Use the same mapping as the training environment.
+        observation = self.model_info.model.get_observation(state)
+        return np.asarray(self.state_features[observation], dtype=np.float32)
+
     def _pair_features(self, state, action_distribution, feature_dim):
         pairs = list(reachable_pair_probs(self.model_info, state, action_distribution).items())
         assert pairs, f"No (action, next-state) pairs reachable from state {state}."
@@ -208,7 +214,7 @@ class NNRiskBudget(RiskBudgetFunction):
         pair_vmax = np.zeros([max_pairs], dtype=np.float32)
         pair_mask = np.zeros([max_pairs], dtype=bool)
         for idx, ((a, s2), p) in enumerate(pairs):
-            pair_state_features[idx] = np.asarray(self.state_features[s2], dtype=np.float32)
+            pair_state_features[idx] = self._features(s2)
             pair_action_onehot[idx, a] = 1.0
             pair_prob[idx] = p
             pair_vmin[idx] = self.model_info.vmin[s2]
@@ -227,9 +233,9 @@ class NNRiskBudget(RiskBudgetFunction):
         distributions_seq = history[1::3]
         num_steps = len(states_seq)
 
-        feature_dim = np.asarray(self.state_features[state]).shape[-1]
+        feature_dim = self._features(state).shape[-1]
         state_features_seq = np.stack(
-            [np.asarray(self.state_features[s], dtype=np.float32) for s in states_seq])
+            [self._features(s) for s in states_seq])
         action_distribution_seq = np.zeros([num_steps, self.max_actions], dtype=np.float32)
         for i, d in enumerate(distributions_seq):
             action_distribution_seq[i, :len(d)] = d
@@ -263,11 +269,11 @@ class NNRiskBudget(RiskBudgetFunction):
 
     def _incremental_step(self, state, action_distribution, cached_state):
         network_state, _, _ = cached_state
-        feature_dim = np.asarray(self.state_features[state]).shape[-1]
+        feature_dim = self._features(state).shape[-1]
         pairs, pair_state_features, pair_action_onehot, pair_prob, pair_vmin, pair_vmax, pair_mask = (
             self._pair_features(state, action_distribution, feature_dim))
 
-        new_state_features = np.asarray(self.state_features[state], dtype=np.float32)
+        new_state_features = self._features(state)
         new_action_distribution = np.zeros([self.max_actions], dtype=np.float32)
         new_action_distribution[:len(action_distribution)] = action_distribution
 

@@ -165,7 +165,11 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         self._pair_states[i] = [s2 for (_, s2), _ in pairs]
         self._num_valid_pairs[i] = len(pairs)
 
-        state_features = np.asarray(self._environment.observation_valuations[state], dtype=np.float32)
+        # This table is indexed by observation ID, even for fully observable models.
+        # Fully observable means a bijection, not that observation IDs equal state IDs.
+        model = self.model_info.model
+        state_features = np.asarray(
+            self._environment.observation_valuations[model.get_observation(state)], dtype=np.float32)
         action_distribution = np.zeros([self.max_actions], dtype=np.float32)
         action_distribution[:len(distribution)] = distribution
 
@@ -176,7 +180,8 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         pair_vmax = np.zeros([self.max_pairs], dtype=np.float32)
         pair_mask = np.zeros([self.max_pairs], dtype=bool)
         for idx, ((a, s2), p) in enumerate(pairs):
-            pair_state_features[idx] = np.asarray(self._environment.observation_valuations[s2], dtype=np.float32)
+            pair_state_features[idx] = np.asarray(
+                self._environment.observation_valuations[model.get_observation(s2)], dtype=np.float32)
             pair_action_onehot[idx, a] = 1.0
             pair_prob[idx] = p
             pair_vmin[idx] = self.model_info.vmin[s2]
