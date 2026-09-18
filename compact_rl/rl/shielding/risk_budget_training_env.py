@@ -82,6 +82,7 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
             "pair_vmin": tensor_spec.TensorSpec([self.max_pairs], tf.float32, "pair_vmin"),
             "pair_vmax": tensor_spec.TensorSpec([self.max_pairs], tf.float32, "pair_vmax"),
             "pair_mask": tensor_spec.TensorSpec([self.max_pairs], tf.bool, "pair_mask"),
+            # "allocation_active": tensor_spec.TensorSpec([], tf.bool, "allocation_active"),
         }
         self._action_spec = tensor_spec.TensorSpec([self.max_pairs], tf.float32, "risk_budget_logits")
         self._time_step_spec = build_time_step_spec(
@@ -209,6 +210,40 @@ class RiskBudgetTrainingEnv(py_environment.PyEnvironment):
         if self._shield.use_l1_projection:
             return self._shield._closest_allowed_distribution(state, local_proposed, remaining_risk)
         return clamp_distribution(local_proposed, self._shield.vmin_actions[state])
+
+    def _allocation_active(self, i, state, distribution, eps=1e-10):
+        qmax = self._shield._qmax(state, distribution)
+        qmin = self._shield._qmin(state, distribution)
+
+        slack = min(self._remaining_risk[i], qmax) - qmin
+
+        # No slack to distribute => allocation cannot matter.
+        if slack <= eps:
+            return False
+
+        probs = reachable_pair_probs(
+            self.model_info, state, distribution
+        )
+
+        capacities = [
+            distribution[a]
+            * p
+            * (self.model_info.vmax[s2] - self.model_info.vmin[s2])
+            for (a, s2), p in probs.items()
+        ]
+
+        positive = sum(c > eps for c in capacities)
+
+        # Only one successor can absorb risk => unique allocation.
+        if positive <= 1:
+            return False
+
+        # Total capacity exactly exhausts the slack:
+        # every capacity must be saturated, hence allocation is unique.
+        if sum(capacities) <= slack + eps:
+            return False
+
+        return True
 
     def _reset(self):
         time_step = self._environment.reset()

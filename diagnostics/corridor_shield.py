@@ -15,6 +15,7 @@ import random
 import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 
@@ -105,6 +106,36 @@ def setup(args):
         env._build_observation_for_lane = build_observation
     return environment, info, env, TFPyEnvironment(env)
 
+def allocation_active_mask(env, info):
+    """Return which lanes currently have a non-forced wasteless allocation choice."""
+    is_last = env.current_time_step().is_last().numpy()
+    active = []
+    for i, state in enumerate(env._last_states):
+        d = env._last_distributions[i]
+        slack = min(env._remaining_risk[i], env._shield._qmax(state, d)) - env._last_qmin_ds[i]
+        capacities = [
+            d[a] * p * (info.vmax[s] - info.vmin[s])
+            for (a, s), p in reachable_pair_probs(info, state, d).items()
+        ]
+        active.append(
+            slack > 1e-10
+            and sum(c > 1e-10 for c in capacities) > 1
+            and sum(capacities) > slack + 1e-10
+            and not is_last[i]
+        )
+    return np.asarray(active, dtype=bool)
+
+
+def install_active_recorder(env, info, active_history):
+    """Record whether each sampled allocation can affect successor budgets."""
+    original_step = env._step
+
+    def recording_step(action):
+        active_history.append(allocation_active_mask(env, info))
+        return original_step(action)
+
+    env._step = recording_step
+
 
 def fixed_logits(env, budget):
     result = np.zeros((env.num_envs, env.max_pairs), np.float32)
@@ -191,24 +222,10 @@ def train(args):
     actor, optimizer = build_actor(env, tf_env, learning_rate=args.learning_rate)
     actor._std_bias.assign(np.log(np.expm1(args.initial_std)))
     active_history = []
-    original_step = env._step
-
-    def recording_step(action):
-        active = []
-        for i, state in enumerate(env._last_states):
-            d = env._last_distributions[i]
-            slack = min(env._remaining_risk[i], env._shield._qmax(state, d)) - env._last_qmin_ds[i]
-            capacities = [d[a] * p * (info.vmax[s] - info.vmin[s])
-                          for (a, s), p in reachable_pair_probs(info, state, d).items()]
-            active.append(slack > 1e-10 and sum(c > 1e-10 for c in capacities) > 1
-                          and sum(capacities) > slack + 1e-10
-                          and not env.current_time_step().is_last().numpy()[i])
-        active_history.append(active)
-        return original_step(action)
-
-    env._step = recording_step
+    install_active_recorder(env, info, active_history)
     started = time.monotonic()
     records = []
+    loss_history = []
     for iteration in range(args.iterations + 1):
         if iteration % args.report_every == 0 or iteration == args.iterations:
             deterministic = evaluate_env(env, tf_env, actor=actor, episodes=4)
@@ -233,13 +250,59 @@ def train(args):
         returns, valid = compute_returns_and_mask(rewards, discounts)
         active = np.asarray(active_history).T
         if args.active_only:
+            # Keep all rewards in the returns, but do not attach those returns to
+            # allocations whose wasteless refinement is forced.
             valid &= active
+        if not np.any(valid):
+            raise AssertionError("No valid active allocation decisions in training window")
         loss, baseline, _ = train_step(actor, optimizer, obs, step_types, actions, returns, valid,
                                       initial_state, ages, env.gamma)
+        loss_value = float(loss)
+        loss_history.append((iteration, loss_value))
         if iteration % args.report_every == 0:
             print("BATCH", iteration, "active_fraction", float(active.mean()), "loss", loss, flush=True)
-        if not np.isfinite(loss):
+        if not np.isfinite(loss_value):
             raise AssertionError(f"Nonfinite loss at {iteration}")
+
+    plot_dir = Path(args.output) if args.output else Path(".")
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    if loss_history and records:
+        loss_iterations, losses = zip(*loss_history)
+        report_iterations = [record["iteration"] for record in records]
+        deterministic_costs = [record["deterministic_cost"] for record in records]
+        stochastic_costs = [record["stochastic_cost"] for record in records]
+        stds = [record["std"] for record in records]
+
+        fig, loss_ax = plt.subplots(figsize=(9, 5.5))
+        metric_ax = loss_ax.twinx()
+
+        loss_line, = loss_ax.plot(loss_iterations, losses, label="Loss")
+        deterministic_line, = metric_ax.plot(
+            report_iterations, deterministic_costs, marker="o", label="Deterministic cost"
+        )
+        stochastic_line, = metric_ax.plot(
+            report_iterations, stochastic_costs, marker="o", label="Stochastic cost"
+        )
+        std_line, = metric_ax.plot(
+            report_iterations, stds, marker="o", label="Std"
+        )
+
+        loss_ax.set_xlabel("Iteration")
+        loss_ax.set_ylabel("Loss")
+        metric_ax.set_ylabel("Cost / std")
+        loss_ax.set_title("Training metrics")
+        loss_ax.grid(True, alpha=0.3)
+
+        lines = [loss_line, deterministic_line, stochastic_line, std_line]
+        loss_ax.legend(lines, [line.get_label() for line in lines], loc="best")
+
+        fig.tight_layout()
+        metrics_plot = plot_dir / "training_metrics.pdf"
+        fig.savefig(metrics_plot, bbox_inches="tight")
+        plt.close(fig)
+        print("TRAINING_METRICS_PLOT", metrics_plot, flush=True)
+
     if args.output:
         Path(args.output).mkdir(parents=True, exist_ok=True)
         save_actor(actor, args.output)
@@ -272,6 +335,8 @@ def evaluate(args):
 def gradient(args):
     _, info, env, tf_env = setup(args)
     actor, optimizer = build_actor(env, tf_env)
+    active_history = []
+    install_active_recorder(env, info, active_history)
     ts = tf_env.reset()
     initial_state = actor.get_initial_state(env.num_envs)
     print("INITIAL_PAIRS", [(env._choice_labels(env._last_states[0])[a], coordinates(info.model, s))
@@ -281,6 +346,12 @@ def gradient(args):
     batch = collect_window(actor, tf_env, initial_state, args.window)
     obs, actions, steps, rewards, discounts, _, ages, initial_state, _, _ = batch
     returns, valid = compute_returns_and_mask(rewards, discounts)
+    active = np.asarray(active_history).T
+    print("ACTIVE_FRACTION", float(active.mean()), flush=True)
+    if args.active_only:
+        valid &= active
+    if not np.any(valid):
+        raise AssertionError("No valid active allocation decisions in gradient window")
     advantage = tf.constant(returns - returns[valid].mean())
     with tf.GradientTape() as tape:
         dist, _ = actor(obs, steps, initial_state, training=True)
@@ -319,7 +390,14 @@ def main():
     parser.add_argument("--initial-std", type=float, default=0.35)
     parser.add_argument("--budget", default="corridor-oracle")
     parser.add_argument("--output")
-    parser.add_argument("--active-only", action="store_true")
+    parser.add_argument(
+        "--active-only", dest="active_only", action="store_true", default=True,
+        help="Mask forced allocation decisions out of the REINFORCE loss (default).",
+    )
+    parser.add_argument(
+        "--all-actions", dest="active_only", action="store_false",
+        help="Ablation: include forced/inactive allocation decisions in the REINFORCE loss.",
+    )
     parser.add_argument("--legacy-features", action="store_true",
                         help="Reproduce the original state-ID/observation-ID indexing bug.")
     args = parser.parse_args()
