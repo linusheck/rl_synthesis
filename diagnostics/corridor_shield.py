@@ -2,7 +2,10 @@
 
 Run from the repository root with MPLCONFIGDIR=/tmp/rl-synthesis-mpl:
   .venv/bin/python -m diagnostics.corridor_shield check
-  .venv/bin/python -m diagnostics.corridor_shield train --iterations 100
+  .venv/bin/python -m diagnostics.corridor_shield train --iterations 100 --method reinforce
+  .venv/bin/python -m diagnostics.corridor_shield train --iterations 100 --method normalized
+  .venv/bin/python -m diagnostics.corridor_shield train --iterations 100 --method critic
+  .venv/bin/python -m diagnostics.corridor_shield train --iterations 100 --method ppo
   .venv/bin/python -m diagnostics.corridor_shield evaluate --budget corridor-oracle
 
 The evaluation subcommand invokes shielding.py's actual Click entry point,
@@ -126,12 +129,30 @@ def allocation_active_mask(env, info):
     return np.asarray(active, dtype=bool)
 
 
-def install_active_recorder(env, info, active_history):
-    """Record whether each sampled allocation can affect successor budgets."""
+def allocation_slack(env):
+    """Current distributable slack for every simulator lane, before sampling an allocation."""
+    return np.asarray([
+        min(env._remaining_risk[i], env._shield._qmax(state, env._last_distributions[i]))
+        - env._last_qmin_ds[i]
+        for i, state in enumerate(env._last_states)
+    ], dtype=np.float32)
+
+
+def install_active_recorder(env, info, active_history, risk_history=None, slack_history=None):
+    """Record pre-action quantities that are legitimate action-independent baselines.
+
+    `active_history` says whether the raw allocation can change successor budgets.
+    The optional risk/slack histories are state information observed *before* the sampled
+    allocation, so a critic may use them without depending on the current action.
+    """
     original_step = env._step
 
     def recording_step(action):
         active_history.append(allocation_active_mask(env, info))
+        if risk_history is not None:
+            risk_history.append(np.asarray(env._remaining_risk, dtype=np.float32).copy())
+        if slack_history is not None:
+            slack_history.append(allocation_slack(env))
         return original_step(action)
 
     env._step = recording_step
@@ -217,24 +238,264 @@ def check(args):
               for (a, s), b in allocation.items()], flush=True)
 
 
+class CorridorValueBaseline(tf.keras.Model):
+    """Small feed-forward value baseline for this diagnostic.
+
+    It uses only pre-action information: the same global observation seen by the actor,
+    plus current remaining risk and distributable slack. It never sees the sampled
+    allocation, so it is a valid policy-gradient baseline. A feed-forward critic is
+    intentional here: the corridor witness is memoryless, while a recurrent critic would
+    require carrying its hidden state consistently across collection windows.
+    """
+
+    def __init__(self):
+        super().__init__(name="CorridorValueBaseline")
+        self._hidden_1 = tf.keras.layers.Dense(64, activation="relu")
+        self._hidden_2 = tf.keras.layers.Dense(64, activation="relu")
+        self._value = tf.keras.layers.Dense(1, activation=None)
+
+    def call(self, observations, remaining_risk, slack, training=False):
+        x = tf.concat([
+            tf.cast(observations["state_features"], tf.float32),
+            tf.cast(observations["action_distribution"], tf.float32),
+            tf.cast(remaining_risk[..., tf.newaxis], tf.float32),
+            tf.cast(slack[..., tf.newaxis], tf.float32),
+        ], axis=-1)
+        x = self._hidden_1(x, training=training)
+        x = self._hidden_2(x, training=training)
+        return tf.squeeze(self._value(x, training=training), axis=-1)
+
+
+def _masked_mean(values, mask):
+    mask = tf.cast(mask, tf.float32)
+    return tf.reduce_sum(tf.cast(values, tf.float32) * mask) / tf.maximum(tf.reduce_sum(mask), 1.0)
+
+
+def _normalize_advantage(advantage, mask, eps=1e-8):
+    """Standardize only over actor decisions that actually contribute to the gradient."""
+    mask_tf = tf.cast(mask, tf.float32)
+    mean = _masked_mean(advantage, mask_tf)
+    centered = tf.cast(advantage, tf.float32) - mean
+    variance = _masked_mean(tf.square(centered), mask_tf)
+    return centered / tf.sqrt(variance + eps), mean, tf.sqrt(variance + eps)
+
+
+def _apply_gradients(optimizer, grads, variables, clip_norm):
+    pairs = [(g, v) for g, v in zip(grads, variables) if g is not None]
+    if not pairs:
+        return 0.0
+    grad_list, var_list = zip(*pairs)
+    raw_norm = tf.linalg.global_norm(grad_list)
+    if clip_norm and clip_norm > 0:
+        grad_list, _ = tf.clip_by_global_norm(grad_list, clip_norm)
+    optimizer.apply_gradients(zip(grad_list, var_list))
+    return float(raw_norm.numpy())
+
+
+def train_normalized_reinforce(actor, optimizer, observations, step_types, actions, returns,
+                               actor_mask, initial_policy_state, episode_ages, gamma, clip_norm):
+    """REINFORCE with the exact active-action mask and whitened advantages."""
+    mask = tf.constant(actor_mask, dtype=tf.float32)
+    returns_tf = tf.constant(returns, dtype=tf.float32)
+    baseline = _masked_mean(returns_tf, mask)
+    advantage, _, advantage_std = _normalize_advantage(returns_tf - baseline, mask)
+    outer_discount = tf.constant(np.power(gamma, episode_ages), dtype=tf.float32)
+
+    with tf.GradientTape() as tape:
+        dist, _ = actor(observations, step_types, initial_policy_state, training=True)
+        log_probs = dist.log_prob(actions)
+        loss = -tf.reduce_sum(outer_discount * tf.stop_gradient(advantage) * log_probs * mask) \
+               / tf.maximum(tf.reduce_sum(mask), 1.0)
+    grads = tape.gradient(loss, actor.trainable_variables)
+    grad_norm = _apply_gradients(optimizer, grads, actor.trainable_variables, clip_norm)
+    return dict(
+        loss=float(loss.numpy()),
+        baseline=float(baseline.numpy()),
+        advantage_std=float(advantage_std.numpy()),
+        grad_norm=grad_norm,
+        critic_loss=float("nan"),
+    )
+
+
+def train_value_baseline(actor, actor_optimizer, critic, critic_optimizer, observations, step_types,
+                         actions, returns, actor_mask, value_mask, initial_policy_state,
+                         episode_ages, gamma, remaining_risk, slack, normalize_advantages,
+                         clip_norm, critic_epochs):
+    """REINFORCE with a learned pre-action V baseline and Monte-Carlo value targets.
+
+    The actor still uses the exact complete return-to-go; the critic is only a control
+    variate. The critic is trained on every complete-return step, including forced-action
+    steps, because those are still valid state-value targets. Only the actor loss is masked
+    to genuine allocation choices.
+    """
+    actor_mask_tf = tf.constant(actor_mask, dtype=tf.float32)
+    value_mask_tf = tf.constant(value_mask, dtype=tf.float32)
+    returns_tf = tf.constant(returns, dtype=tf.float32)
+    risk_tf = tf.constant(remaining_risk, dtype=tf.float32)
+    slack_tf = tf.constant(slack, dtype=tf.float32)
+    outer_discount = tf.constant(np.power(gamma, episode_ages), dtype=tf.float32)
+
+    # Use the critic *before* fitting it to this batch for the actor update.
+    values_before = critic(observations, risk_tf, slack_tf, training=False)
+    raw_advantage = returns_tf - tf.stop_gradient(values_before)
+    if normalize_advantages:
+        advantage, _, advantage_std = _normalize_advantage(raw_advantage, actor_mask_tf)
+    else:
+        advantage = raw_advantage
+        centered = raw_advantage - _masked_mean(raw_advantage, actor_mask_tf)
+        advantage_std = tf.sqrt(_masked_mean(tf.square(centered), actor_mask_tf) + 1e-8)
+
+    with tf.GradientTape() as actor_tape:
+        dist, _ = actor(observations, step_types, initial_policy_state, training=True)
+        log_probs = dist.log_prob(actions)
+        actor_loss = -tf.reduce_sum(
+            outer_discount * tf.stop_gradient(advantage) * log_probs * actor_mask_tf
+        ) / tf.maximum(tf.reduce_sum(actor_mask_tf), 1.0)
+    actor_grads = actor_tape.gradient(actor_loss, actor.trainable_variables)
+    actor_grad_norm = _apply_gradients(
+        actor_optimizer, actor_grads, actor.trainable_variables, clip_norm
+    )
+
+    critic_loss = None
+    critic_grad_norm = 0.0
+    for _ in range(max(int(critic_epochs), 1)):
+        with tf.GradientTape() as critic_tape:
+            values = critic(observations, risk_tf, slack_tf, training=True)
+            squared_error = tf.square(values - returns_tf)
+            critic_loss = tf.reduce_sum(squared_error * value_mask_tf) \
+                          / tf.maximum(tf.reduce_sum(value_mask_tf), 1.0)
+        critic_grads = critic_tape.gradient(critic_loss, critic.trainable_variables)
+        critic_grad_norm = _apply_gradients(
+            critic_optimizer, critic_grads, critic.trainable_variables, clip_norm
+        )
+
+    return dict(
+        loss=float(actor_loss.numpy()),
+        baseline=float(_masked_mean(values_before, actor_mask_tf).numpy()),
+        advantage_std=float(advantage_std.numpy()),
+        grad_norm=actor_grad_norm,
+        critic_loss=float(critic_loss.numpy()),
+        critic_grad_norm=critic_grad_norm,
+    )
+
+
+
+def train_ppo(actor, actor_optimizer, critic, critic_optimizer, observations, step_types,
+              actions, returns, actor_mask, value_mask, initial_policy_state, episode_ages,
+              gamma, remaining_risk, slack, normalize_advantages, clip_norm,
+              critic_epochs, ppo_epochs, ppo_clip):
+    """Clipped PPO on the same complete Monte-Carlo returns, with forced actions masked out.
+
+    This deliberately keeps the corridor experiment simple: the critic supplies a baseline,
+    while the exact complete return remains the target. No entropy bonus is used because the
+    Gaussian logit entropy is unbounded in its standard deviation.
+    """
+    actor_mask_tf = tf.constant(actor_mask, dtype=tf.float32)
+    value_mask_tf = tf.constant(value_mask, dtype=tf.float32)
+    returns_tf = tf.constant(returns, dtype=tf.float32)
+    risk_tf = tf.constant(remaining_risk, dtype=tf.float32)
+    slack_tf = tf.constant(slack, dtype=tf.float32)
+    outer_discount = tf.constant(np.power(gamma, episode_ages), dtype=tf.float32)
+
+    old_dist, _ = actor(observations, step_types, initial_policy_state, training=False)
+    old_log_probs = tf.stop_gradient(old_dist.log_prob(actions))
+    old_values = tf.stop_gradient(critic(observations, risk_tf, slack_tf, training=False))
+    raw_advantage = returns_tf - old_values
+    if normalize_advantages:
+        advantage, _, advantage_std = _normalize_advantage(raw_advantage, actor_mask_tf)
+    else:
+        advantage = raw_advantage
+        centered = raw_advantage - _masked_mean(raw_advantage, actor_mask_tf)
+        advantage_std = tf.sqrt(_masked_mean(tf.square(centered), actor_mask_tf) + 1e-8)
+    advantage = tf.stop_gradient(advantage)
+
+    actor_loss = None
+    actor_grad_norm = 0.0
+    approx_kl = 0.0
+    clip_fraction = 0.0
+    for _ in range(max(int(ppo_epochs), 1)):
+        with tf.GradientTape() as actor_tape:
+            dist, _ = actor(observations, step_types, initial_policy_state, training=True)
+            log_probs = dist.log_prob(actions)
+            log_ratio = tf.clip_by_value(log_probs - old_log_probs, -20.0, 20.0)
+            ratio = tf.exp(log_ratio)
+            clipped_ratio = tf.clip_by_value(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
+            surrogate = tf.minimum(ratio * advantage, clipped_ratio * advantage)
+            actor_loss = -tf.reduce_sum(outer_discount * surrogate * actor_mask_tf) \
+                         / tf.maximum(tf.reduce_sum(actor_mask_tf), 1.0)
+        actor_grads = actor_tape.gradient(actor_loss, actor.trainable_variables)
+        actor_grad_norm = _apply_gradients(
+            actor_optimizer, actor_grads, actor.trainable_variables, clip_norm
+        )
+        new_dist, _ = actor(observations, step_types, initial_policy_state, training=False)
+        new_log_probs = new_dist.log_prob(actions)
+        approx_kl = float(_masked_mean(old_log_probs - new_log_probs, actor_mask_tf).numpy())
+        changed = tf.cast(tf.abs(tf.exp(tf.clip_by_value(new_log_probs - old_log_probs, -20.0, 20.0)) - 1.0)
+                          > ppo_clip, tf.float32)
+        clip_fraction = float(_masked_mean(changed, actor_mask_tf).numpy())
+
+    critic_loss = None
+    critic_grad_norm = 0.0
+    for _ in range(max(int(critic_epochs), 1)):
+        with tf.GradientTape() as critic_tape:
+            values = critic(observations, risk_tf, slack_tf, training=True)
+            squared_error = tf.square(values - returns_tf)
+            critic_loss = tf.reduce_sum(squared_error * value_mask_tf) \
+                          / tf.maximum(tf.reduce_sum(value_mask_tf), 1.0)
+        critic_grads = critic_tape.gradient(critic_loss, critic.trainable_variables)
+        critic_grad_norm = _apply_gradients(
+            critic_optimizer, critic_grads, critic.trainable_variables, clip_norm
+        )
+
+    return dict(
+        loss=float(actor_loss.numpy()),
+        baseline=float(_masked_mean(old_values, actor_mask_tf).numpy()),
+        advantage_std=float(advantage_std.numpy()),
+        grad_norm=actor_grad_norm,
+        critic_loss=float(critic_loss.numpy()),
+        critic_grad_norm=critic_grad_norm,
+        approx_kl=approx_kl,
+        clip_fraction=clip_fraction,
+    )
+
 def train(args):
     environment, info, env, tf_env = setup(args)
     actor, optimizer = build_actor(env, tf_env, learning_rate=args.learning_rate)
     actor._std_bias.assign(np.log(np.expm1(args.initial_std)))
+
+    critic = None
+    critic_optimizer = None
+    if args.method in ("critic", "ppo"):
+        critic = CorridorValueBaseline()
+        critic_optimizer = tf.keras.optimizers.legacy.Adam(args.value_learning_rate)
+
     active_history = []
-    install_active_recorder(env, info, active_history)
+    risk_history = []
+    slack_history = []
+    install_active_recorder(env, info, active_history, risk_history, slack_history)
     started = time.monotonic()
     records = []
     loss_history = []
+    critic_loss_history = []
+
     for iteration in range(args.iterations + 1):
         if iteration % args.report_every == 0 or iteration == args.iterations:
             deterministic = evaluate_env(env, tf_env, actor=actor, episodes=4)
             stochastic = evaluate_env(env, tf_env, actor=actor, stochastic=True, episodes=4)
-            record = dict(iteration=iteration, deterministic_cost=deterministic, stochastic_cost=stochastic,
-                          std=float(tf.nn.softplus(actor._std_bias)), seconds=time.monotonic() - started)
+            record = dict(
+                iteration=iteration,
+                method=args.method,
+                deterministic_cost=deterministic,
+                stochastic_cost=stochastic,
+                std=float(tf.nn.softplus(actor._std_bias)),
+                seconds=time.monotonic() - started,
+            )
             initial_ts = tf_env.reset()
-            initial_dist, _ = actor(initial_ts.observation, initial_ts.step_type,
-                                    actor.get_initial_state(env.num_envs))
+            initial_dist, _ = actor(
+                initial_ts.observation,
+                initial_ts.step_type,
+                actor.get_initial_state(env.num_envs),
+            )
             record["initial_logits"] = initial_dist.mean().numpy()[0, :env._num_valid_pairs[0]].tolist()
             records.append(record)
             print("RESULT", json.dumps(record), flush=True)
@@ -242,25 +503,97 @@ def train(args):
             tf_env.reset()
             policy_state = actor.get_initial_state(env.num_envs)
             age = np.zeros(env.num_envs)
+
         if iteration == args.iterations:
             break
+
         active_history.clear()
+        risk_history.clear()
+        slack_history.clear()
         (obs, actions, step_types, rewards, discounts, next_steps, ages,
-         initial_state, policy_state, age) = collect_window(actor, tf_env, policy_state, args.window, age)
-        returns, valid = compute_returns_and_mask(rewards, discounts)
-        active = np.asarray(active_history).T
+         initial_state, policy_state, age) = collect_window(
+            actor, tf_env, policy_state, args.window, age
+        )
+        returns, complete_valid = compute_returns_and_mask(rewards, discounts)
+        active = np.asarray(active_history, dtype=bool).T
+        remaining_risk = np.asarray(risk_history, dtype=np.float32).T
+        slack = np.asarray(slack_history, dtype=np.float32).T
+
+        actor_valid = complete_valid.copy()
         if args.active_only:
-            # Keep all rewards in the returns, but do not attach those returns to
-            # allocations whose wasteless refinement is forced.
-            valid &= active
-        if not np.any(valid):
-            raise AssertionError("No valid active allocation decisions in training window")
-        loss, baseline, _ = train_step(actor, optimizer, obs, step_types, actions, returns, valid,
-                                      initial_state, ages, env.gamma)
-        loss_value = float(loss)
+            # Keep every reward in every earlier return, but do not attach those
+            # returns to raw allocations whose wasteless refinement is forced.
+            actor_valid &= active
+        if not np.any(actor_valid):
+            raise AssertionError("No valid allocation decisions in training window")
+
+        if args.method == "reinforce":
+            loss, baseline, _ = train_step(
+                actor, optimizer, obs, step_types, actions, returns, actor_valid,
+                initial_state, ages, env.gamma
+            )
+            metrics = dict(
+                loss=float(loss), baseline=float(baseline), advantage_std=float("nan"),
+                grad_norm=float("nan"), critic_loss=float("nan")
+            )
+        elif args.method == "analytic":
+            loss, baseline, c_star = train_step(
+                actor, optimizer, obs, step_types, actions, returns, actor_valid,
+                initial_state, ages, env.gamma, use_analytic_baseline=True
+            )
+            metrics = dict(
+                loss=float(loss), baseline=float(baseline), advantage_std=float("nan"),
+                grad_norm=float("nan"), critic_loss=float("nan"), c_star=float(c_star)
+            )
+        elif args.method == "normalized":
+            metrics = train_normalized_reinforce(
+                actor, optimizer, obs, step_types, actions, returns, actor_valid,
+                initial_state, ages, env.gamma, args.grad_clip
+            )
+        elif args.method == "critic":
+            metrics = train_value_baseline(
+                actor, optimizer, critic, critic_optimizer, obs, step_types, actions,
+                returns, actor_valid, complete_valid, initial_state, ages, env.gamma,
+                remaining_risk, slack, args.normalize_advantages, args.grad_clip,
+                args.critic_epochs,
+            )
+        elif args.method == "ppo":
+            metrics = train_ppo(
+                actor, optimizer, critic, critic_optimizer, obs, step_types, actions,
+                returns, actor_valid, complete_valid, initial_state, ages, env.gamma,
+                remaining_risk, slack, args.normalize_advantages, args.grad_clip,
+                args.critic_epochs, args.ppo_epochs, args.ppo_clip,
+            )
+        else:
+            raise ValueError(args.method)
+
+        loss_value = float(metrics["loss"])
         loss_history.append((iteration, loss_value))
+        if np.isfinite(metrics.get("critic_loss", np.nan)):
+            critic_loss_history.append((iteration, metrics["critic_loss"]))
+
         if iteration % args.report_every == 0:
-            print("BATCH", iteration, "active_fraction", float(active.mean()), "loss", loss, flush=True)
+            batch_record = dict(
+                iteration=iteration,
+                method=args.method,
+                active_fraction=float(active.mean()),
+                active_count=int(actor_valid.sum()),
+                complete_count=int(complete_valid.sum()),
+                loss=loss_value,
+                baseline=float(metrics.get("baseline", np.nan)),
+                advantage_std=float(metrics.get("advantage_std", np.nan)),
+                grad_norm=float(metrics.get("grad_norm", np.nan)),
+                critic_loss=float(metrics.get("critic_loss", np.nan)),
+            )
+            if "critic_grad_norm" in metrics:
+                batch_record["critic_grad_norm"] = float(metrics["critic_grad_norm"])
+            if "c_star" in metrics:
+                batch_record["c_star"] = float(metrics["c_star"])
+            if "approx_kl" in metrics:
+                batch_record["approx_kl"] = float(metrics["approx_kl"])
+                batch_record["clip_fraction"] = float(metrics["clip_fraction"])
+            print("BATCH", json.dumps(batch_record), flush=True)
+
         if not np.isfinite(loss_value):
             raise AssertionError(f"Nonfinite loss at {iteration}")
 
@@ -277,7 +610,7 @@ def train(args):
         fig, loss_ax = plt.subplots(figsize=(9, 5.5))
         metric_ax = loss_ax.twinx()
 
-        loss_line, = loss_ax.plot(loss_iterations, losses, label="Loss")
+        loss_line, = loss_ax.plot(loss_iterations, losses, label="Actor loss")
         deterministic_line, = metric_ax.plot(
             report_iterations, deterministic_costs, marker="o", label="Deterministic cost"
         )
@@ -289,9 +622,9 @@ def train(args):
         )
 
         loss_ax.set_xlabel("Iteration")
-        loss_ax.set_ylabel("Loss")
+        loss_ax.set_ylabel("Actor loss")
         metric_ax.set_ylabel("Cost / std")
-        loss_ax.set_title("Training metrics")
+        loss_ax.set_title(f"Training metrics ({args.method})")
         loss_ax.grid(True, alpha=0.3)
 
         lines = [loss_line, deterministic_line, stochastic_line, std_line]
@@ -303,9 +636,30 @@ def train(args):
         plt.close(fig)
         print("TRAINING_METRICS_PLOT", metrics_plot, flush=True)
 
+    if critic_loss_history:
+        critic_iterations, critic_losses = zip(*critic_loss_history)
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(critic_iterations, critic_losses, label="Critic MSE")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Critic MSE")
+        ax.set_title("Value-baseline fit")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        critic_plot = plot_dir / "critic_metrics.pdf"
+        fig.savefig(critic_plot, bbox_inches="tight")
+        plt.close(fig)
+        print("CRITIC_METRICS_PLOT", critic_plot, flush=True)
+
     if args.output:
         Path(args.output).mkdir(parents=True, exist_ok=True)
         save_actor(actor, args.output)
+        if critic is not None:
+            critic_ckpt = tf.train.Checkpoint(critic=critic)
+            critic_manager = tf.train.CheckpointManager(
+                critic_ckpt, str(Path(args.output) / "critic"), max_to_keep=5
+            )
+            critic_manager.save()
         Path(args.output, "results.json").write_text(json.dumps(records, indent=2) + "\n")
 
 
@@ -388,6 +742,23 @@ def main():
     parser.add_argument("--report-every", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=8.6e-4)
     parser.add_argument("--initial-std", type=float, default=0.35)
+    parser.add_argument(
+        "--method", choices=["reinforce", "analytic", "normalized", "critic", "ppo"],
+        default="reinforce",
+        help=(
+            "Training estimator: plain masked REINFORCE; model-based analytic control "
+            "variate; advantage-standardized REINFORCE; a learned pre-action value baseline; "
+            "or clipped PPO with that value baseline."
+        ),
+    )
+    parser.add_argument("--grad-clip", type=float, default=5.0,
+                        help="Global-norm clipping for normalized/critic methods; <=0 disables it.")
+    parser.add_argument("--value-learning-rate", type=float, default=3e-3)
+    parser.add_argument("--critic-epochs", type=int, default=3)
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-clip", type=float, default=0.2)
+    parser.add_argument("--normalize-advantages", dest="normalize_advantages", action="store_true", default=True)
+    parser.add_argument("--no-normalize-advantages", dest="normalize_advantages", action="store_false")
     parser.add_argument("--budget", default="corridor-oracle")
     parser.add_argument("--output")
     parser.add_argument(
